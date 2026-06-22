@@ -12,7 +12,7 @@ import graphix.sim.base_backend
 import graphix.sim.statevec
 import graphix.simulator
 import stim
-from graphix import command
+from graphix import Plane, command
 from graphix.clifford import Clifford
 from graphix.command import BaseCommand, BaseM, BaseN, CommandKind
 from graphix.measurements import BlochMeasurement, Measurement, toggle_outcome
@@ -85,6 +85,8 @@ def remove_flow(pattern: Pattern) -> Pattern:
         # pattern types will become more precise in the near future.
         # See https://github.com/TeamGraphix/graphix/issues/266
         clean_pattern.add(cast("CommandType", new_cmd))
+    # See test_reorder_output_nodes.
+    clean_pattern.reorder_output_nodes(pattern.output_nodes)
     return clean_pattern
 
 
@@ -98,6 +100,15 @@ def get_graph_clifford_structure(graph: nx.Graph[int]) -> stim.Tableau:
 
 def qCircuit_predicate(output_string: str) -> bool:
     return int(output_string[0]) == 1
+
+
+def _check_all_measurements_in_xy(pattern: Pattern) -> None:
+    for cmd_m in pattern.extract_measurement_commands().values():
+        plane = cmd_m.measurement.to_bloch().plane
+        if plane != Plane.XY:
+            raise ValueError(
+                f"UBQC only works for measurements in plane XY: {cmd_m.node} is measured in plane {plane.name}."
+            )
 
 
 class Client:
@@ -120,11 +131,15 @@ class Client:
         *,
         stacklevel: int = 1,
     ) -> None:
+        # See test_reject_yz_measurement.
+        _check_all_measurements_in_xy(pattern)
         self.initial_pattern: Pattern = pattern
         self.classical_output = classical_output
         self.output_predicate = output_predicate
+
         self.input_nodes = pattern.input_nodes.copy()
         self.output_nodes = pattern.output_nodes.copy()
+        self.unmeasured_nodes = set() if classical_output else self.output_nodes
         self.input_state = [BasicStates.PLUS for _ in self.input_nodes] if input_state is None else list(input_state)
         self.protocol = protocol or FK12()
         self.parameters = parameters
@@ -165,7 +180,11 @@ class Client:
 
         self.secrets = secrets or Secrets()
         self.secret_datas = SecretDatas.from_secrets(
-            self.secrets, self.graph, set(self.input_nodes), set(self.output_nodes), rng=rng
+            self.secrets,
+            self.graph,
+            set(self.input_nodes),
+            set(self.unmeasured_nodes),
+            rng=rng,
         )
 
         self.clean_pattern = remove_flow(self.initial_pattern)
@@ -191,7 +210,7 @@ class Client:
         return list(self.graph.nodes)
 
     def _add_measurement_commands(self, pattern: Pattern) -> None:
-        for onode in self.output_nodes:
+        for onode in pattern.output_nodes:
             pattern.add(graphix.command.M(node=onode))
 
     def _copy_pattern(self) -> Pattern:
@@ -206,7 +225,7 @@ class Client:
         return copied_pattern.extract_measurement_commands()
 
     def refresh_randomness(self, rng: Generator | None = None, *, stacklevel: int = 1) -> None:
-        "method to refresh random randomness using parameters from Clinent instatiation."
+        "method to refresh random randomness using parameters from Client instantiation."
 
         # refresh only if secrets bool is True; False is no randomness at all.
         if self.secrets is not None:
@@ -214,21 +233,25 @@ class Client:
                 self.secrets,
                 self.graph,
                 set(self.input_nodes),
-                set(self.output_nodes),
+                set(self.unmeasured_nodes),
                 rng=rng,
                 stacklevel=stacklevel + 1,
             )
 
     def get_computation_states(self) -> dict[int, State]:
+        """Return the (unblinded) state in which each node is prepared.
+
+        These states do not depend on the secrets: input nodes are prepared in
+        the specific input state desired by the Client, and every other node is
+        prepared in ``|+>`` by default. Because they are secret-independent, the
+        computation states never need to be refreshed; the secret-dependent
+        blinding is applied separately at the blindness level (see
+        :meth:`SecretDatas.blind_qubit`).
+        """
         states = dict()
         for node in self.graph.nodes:
             if node in self.input_nodes:
                 state = self.input_state[node]
-
-            elif node in self.output_nodes:
-                r_value = self.secret_datas.r.get(node, 0)
-                a_N_value = self.secret_datas.a.a_N.get(node, 0)
-                state = BasicStates.PLUS if r_value ^ a_N_value == 0 else BasicStates.MINUS
 
             else:
                 state = BasicStates.PLUS
@@ -291,6 +314,15 @@ class Client:
         return traps_decision, computation_decision, result_analysis
 
     def decode_output_state(self, backend: Backend[_StateT]) -> None:
+        """Undo the blinding on a quantum output state held by the backend.
+
+        When the output is a classical bitstring, the ``r``/``a_N`` decryption is
+        applied automatically when storing each measurement outcome (see
+        :meth:`BlindMeasureMethod.store_measurement_outcome`). When the output is
+        a quantum state, no measurement happens on the output nodes, so the
+        one-time-pad has to be undone here by applying the byproduct corrections
+        computed in :meth:`decode_output`.
+        """
         for node in self.output_nodes:
             z_decoding, x_decoding = self.decode_output(node)
             if z_decoding:
@@ -299,8 +331,18 @@ class Client:
                 backend.correct_byproduct(command.X(node))
 
     def decode_output(self, node: int) -> tuple[int, int]:
+        """Compute the ``(Z, X)`` byproduct corrections to apply on an output node.
+
+        On top of the flow-induced byproduct (the sum over the ``z_domain`` /
+        ``x_domain`` dependencies), the blinding has to be undone:
+
+        - the ``Z`` correction absorbs the ``r`` one-time-pad (applied to every
+          node) and the ``a_N`` encryption (the ``X`` Pauli propagated from the
+          neighbours' ``a`` secrets through the entangling ``CZ``\\ s);
+        - the ``X`` correction absorbs the input node's own ``a`` encryption.
+        """
         z_decoding = sum(self.results[z_dep] for z_dep in self.byproduct_db[node].z_domain) % 2
-        z_decoding ^= self.secret_datas.r.get(node, 0)
+        z_decoding ^= self.secret_datas.r.get(node, 0) ^ self.secret_datas.a.a_N.get(node, 0)
         x_decoding = sum(self.results[x_dep] for x_dep in self.byproduct_db[node].x_domain) % 2
         x_decoding ^= self.secret_datas.a.a.get(node, 0)
         return z_decoding, x_decoding
@@ -330,9 +372,13 @@ class BlindMeasureMethod(MeasureMethod):
 
     @override
     def store_measurement_outcome(self, node: int, result: Outcome) -> None:
-        if self._client.secret_datas.r:
-            if self._client.secret_datas.r[node]:
-                result = toggle_outcome(result)
+        # The Server returns the outcome of the *blinded* measurement; the Client
+        # decrypts it with `xor r xor a_N` before storing it. `r` is the
+        # one-time-pad applied to every node and `a_N` is the X encryption
+        # propagated from the neighbours' `a` secrets.
+        flip_value = self._client.secret_datas.r.get(node, 0) ^ self._client.secret_datas.a.a_N.get(node, 0)
+        if flip_value:
+            result = toggle_outcome(result)
         self._client.results[node] = result
 
 
@@ -353,10 +399,10 @@ class ClientMeasureMethod(BlindMeasureMethod):
         if t_signal:
             measurement = measurement.clifford(Clifford.Z)
         bloch = measurement.to_bloch()
-        # Blind the angle using the Client's secrets
-        angle = (-1) ** a_value * bloch.angle + self._client.secret_datas.blind_angle(
-            cmd.node, cmd.node in self._client.output_nodes, test=False
-        )
+        # Compensate the blinding inside the measurement angle: the `a` encryption
+        # flips the angle sign (it commutes the X Pauli through the measurement)
+        # and the `theta` encryption is added back via `blind_angle`.
+        angle = (-1) ** a_value * bloch.angle + self._client.secret_datas.blind_angle(cmd.node)
         return BlochMeasurement(angle, bloch.plane)
 
 
@@ -364,6 +410,6 @@ class TestMeasureMethod(BlindMeasureMethod):
     @override
     def describe_measurement(self, cmd: BaseM) -> Measurement:
         # Blind the angle using the Client's secrets
-        angle = self._client.secret_datas.blind_angle(cmd.node, cmd.node in self._client.output_nodes, test=True)
+        angle = self._client.secret_datas.blind_angle(cmd.node)
 
         return Measurement.XY(angle)

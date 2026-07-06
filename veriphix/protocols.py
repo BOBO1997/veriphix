@@ -1,28 +1,31 @@
 from __future__ import annotations
 
 import itertools
-import random
 from abc import ABC, abstractmethod
-from itertools import combinations
+from array import array
 from typing import TYPE_CHECKING
 
 import networkx as nx
-import numpy as np
-import stim
+from graphix.rng import ensure_rng
+from typing_extensions import override
 
 from veriphix.verifying import TestRun
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from typing import TypeVar
+
+    from graphix import Pattern
+    from numpy.random import Generator
+
+    from veriphix.client import Client
+
+    _StateT = TypeVar("_StateT")
 
 
 class VerificationProtocol(ABC):
     @abstractmethod
-    def __init__(self) -> None:
-        pass
-
-    @abstractmethod
-    def create_test_runs(self, client) -> list[TestRun]:
+    def create_test_runs(self, client: Client, rng: Generator | None = None, *, stacklevel: int = 1) -> list[TestRun]:
         pass
 
 
@@ -31,7 +34,8 @@ class FK12(VerificationProtocol):
         super().__init__()
         self.manual_colouring = manual_colouring
 
-    def create_test_runs(self, client) -> list[TestRun]:
+    @override
+    def create_test_runs(self, client: Client, rng: Generator | None = None, *, stacklevel: int = 1) -> list[TestRun]:
         """Creates test runs according to a graph colouring according to [FK12].
         A test run, or a Trappified Canvas, is associated to each color in the colouring.
         For a given test run, the trap nodes are defined as being the nodes belonging to the color the run corresponds to.
@@ -89,7 +93,7 @@ class FK12(VerificationProtocol):
                 )
 
             nodes_by_color = {i: list(c) for i, c in enumerate(self.manual_colouring)}
-            colors = nodes_by_color.keys()
+            colors = set(nodes_by_color.keys())
 
         # Create the test runs : one per color
         test_runs: list[TestRun] = []
@@ -104,6 +108,34 @@ class FK12(VerificationProtocol):
         return test_runs
 
 
+def get_bipartite_coloring(pattern: Pattern) -> tuple[set[int], set[int]]:
+    """Return a bipartite coloring for the given pattern."""
+    positions = get_node_positions(pattern)
+    red = set()
+    blue = set()
+    for node, position in positions.items():
+        if (position[0] + position[1]) % 2:
+            red.add(node)
+        else:
+            blue.add(node)
+    return (red, blue)
+
+
+def get_node_positions(pattern: Pattern, scale: float = 1, reverse_qubit_order: bool = False) -> dict[int, array[int]]:
+    """Return node positions in a grid layout."""
+    width = len(pattern.input_nodes)
+    return {
+        node: array(
+            "i",
+            [
+                int((node // width) * scale),
+                int((width - node % width if reverse_qubit_order else node % width) * scale),
+            ],
+        )
+        for node in range(pattern.n_node)
+    }
+
+
 class RandomTraps(VerificationProtocol):
     """
     A bad and naive way of generating traps, but exposing the modularity of the interface.
@@ -112,152 +144,21 @@ class RandomTraps(VerificationProtocol):
     def __init__(self) -> None:
         super().__init__()
 
-    def create_test_runs(self, client) -> list[TestRun]:
+    @override
+    def create_test_runs(self, client: Client, rng: Generator | None = None, *, stacklevel: int = 1) -> list[TestRun]:
+        rng = ensure_rng(rng, stacklevel=stacklevel + 1)
         test_runs = []
         # Create 1 random trap per node
         n = len(client.graph.nodes)
         for _ in range(n):
             # Choose a random subset of nodes to create a trap (random size, random nodes)
-            trap_size = random.choice(range(n))
-            random_nodes = random.sample(client.nodes, k=trap_size)
+            trap_size = rng.integers(n)
+            random_nodes = [client.nodes[i] for i in rng.choice(len(client.nodes), size=trap_size, replace=False)]
             # Create a single-trap test round from it. The trap is multi-qubit.
-            random_multi_qubit_trap = tuple(random_nodes)
+            random_multi_qubit_trap = frozenset(random_nodes)
             # Only one trap
-            traps = (random_multi_qubit_trap,)
+            traps = frozenset({random_multi_qubit_trap})
             test_run = TestRun(client=client, traps=traps)
             test_runs.append(test_run)
 
         return test_runs
-
-
-class Dummyless(VerificationProtocol):
-    def __init__(self) -> None:
-        super().__init__()
-
-    def create_test_runs(self, client) -> list[TestRun]:
-        G: nx.Graph = client.graph
-        nodes = list(G.nodes)
-        n = len(nodes)
-
-        S_paulis = generate_graph_stabilizers(G)
-
-        # Construct symplectic matrix: 2n x n
-        S_bin = np.array([pauli_to_symplectic(p) for p in S_paulis]).T
-
-        R_gens = generate_stabilizers_I_X_Y_only(G)
-
-        test_runs = []
-        for _, R in enumerate(R_gens):
-            R_bin = pauli_to_symplectic(R)
-            coeffs = gf2_solve(S_bin, R_bin)
-            support = [nodes[j] for j in range(n) if coeffs[j] == 1]
-            test_run = TestRun(client=client, traps=(tuple(support),))
-            test_runs.append(test_run)
-
-        return test_runs
-
-
-# === GF(2) Solver ===
-def gf2_solve(A, b):
-    A = A.copy() % 2
-    b = b.copy() % 2
-    n_rows, n_cols = A.shape
-    x = np.zeros(n_cols, dtype=int)
-    pivot_rows = [-1] * n_rows
-
-    row = 0
-    for col in range(n_cols):
-        for r in range(row, n_rows):
-            if A[r, col] == 1:
-                A[[row, r]] = A[[r, row]]
-                b[[row, r]] = b[[r, row]]
-                break
-        else:
-            continue
-        for r in range(row + 1, n_rows):
-            if A[r, col] == 1:
-                A[r] = (A[r] + A[row]) % 2
-                b[r] = (b[r] + b[row]) % 2
-        pivot_rows[row] = col
-        row += 1
-
-    for r in reversed(range(row)):
-        col = pivot_rows[r]
-        x[col] = b[r]
-        for k in range(r):
-            if A[k, col] == 1:
-                b[k] = (b[k] + x[col]) % 2
-    return x
-
-
-# === Pauli utility ===
-def to_binary_XY_support(pstring: stim.PauliString) -> tuple[int]:
-    return tuple(1 if p in ["X", "Y"] else 0 for p in str(pstring))
-
-
-def pauli_to_symplectic(p: stim.PauliString) -> np.ndarray:
-    # Concatenate Z then X bits (Stim convention)
-    xs, zs = p.to_numpy()
-    return np.concatenate([zs.astype(int), xs.astype(int)])
-
-
-# === Construct graph stabilizers (S_v) ===
-def generate_graph_stabilizers(G: nx.Graph) -> list[stim.PauliString]:
-    n = G.number_of_nodes()
-    idx_map = {v: i for i, v in enumerate(G.nodes)}
-    S = []
-    for v in G.nodes:
-        pauli = ["I"] * n
-        pauli[idx_map[v]] = "X"
-        for u in G.neighbors(v):
-            pauli[idx_map[u]] = "Z"
-        S.append(stim.PauliString("".join(pauli)))
-    return S
-
-
-# === Generate Z-free stabilizers (candidates) ===
-def generate_stabilizers_I_X_Y_only(G: nx.Graph) -> list[stim.PauliString]:
-    n = G.number_of_nodes()
-    idx_map = {v: i for i, v in enumerate(G.nodes)}
-    nodes = list(G.nodes)
-
-    S = generate_graph_stabilizers(G)
-
-    R_full = stim.PauliString("I" * n)
-    for stab in S:
-        R_full *= stab
-
-    candidates = []
-
-    # Even-degree node flips
-    even_nodes = [v for v in nodes if G.degree[v] % 2 == 0]
-    for v in even_nodes:
-        Rv = R_full * S[idx_map[v]]
-        if Rv.pauli_indices("Z") == []:
-            candidates.append(Rv)
-
-    # Odd-degree pairs connected by even-degree interior paths
-    odd_nodes = [v for v in nodes if G.degree[v] % 2 == 1]
-    for u, w in combinations(odd_nodes, 2):
-        try:
-            path = nx.shortest_path(G, u, w)
-        except nx.NetworkXNoPath:
-            continue
-        if all(G.degree[v] % 2 == 0 for v in path[1:-1]):
-            Ruw = R_full.copy()
-            for v in path:
-                Ruw *= S[idx_map[v]]
-            if Ruw.pauli_indices("Z") == []:
-                candidates.append(Ruw)
-
-    # Greedily pick n - 1 linearly independent (based on XY support)
-    basis = []
-    basis_bin = []
-    for cand in candidates:
-        vec = to_binary_XY_support(cand)
-        if vec not in basis_bin:
-            basis.append(cand)
-            basis_bin.append(vec)
-        if len(basis) == n - 1:
-            break
-    return basis

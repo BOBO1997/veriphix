@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  push:
+    branches: ['main']
   pull_request:
     branches: ["main"]
   workflow_dispatch:
@@ -14,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ["ubuntu-latest", "windows-2022", "macos-latest"]
-        python: ["3.10", "3.11", "3.12"]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     name: "Python ${{ matrix.python }} / ${{ matrix.os }}"
     runs-on: ${{ matrix.os }}
@@ -35,9 +37,6 @@ jobs:
 
       - name: Install the dependencies
         run: pip install -r requirements.txt
-
-      - name: Sample the circuits
-        run: python -m veriphix.sampling_circuits.experiments
 
       - name: Run tox
         run: tox
